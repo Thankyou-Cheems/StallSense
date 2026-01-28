@@ -1,91 +1,60 @@
-# Windows idle freeze troubleshooting guide (no display, high power, instant power-off)
+# Freeze Risk Analyzer (Windows)
 
-Symptoms that match this guide:
-- After long idle time the screen stays black or never wakes
+A small TypeScript CLI that scans Windows Event Viewer signals (Kernel-Power 41, GPU driver errors, WHEA) to estimate the risk of idle-resume hangs and suggests targeted fixes.
+
+## Quick Start
+```bash
+npm install
+npm run build
+npm run analyze
+```
+
+## CLI Usage
+```bash
+node dist/index.js analyze [--days N] [--json] [--out path]
+node dist/index.js fix --pcie-off [--dry-run]
+```
+
+Options:
+- `--days N`: How many days of System log history to scan (default: 7).
+- `--json`: Print a full JSON report to stdout.
+- `--out path`: Write the JSON report to a file.
+- `fix --pcie-off`: Disable PCIe Link State Power Management for the active power plan.
+- `--dry-run`: Print the `powercfg` commands without applying changes.
+
+Examples:
+```bash
+npm run analyze -- --days 14
+npm run analyze -- --json --out report.json
+npm run fix -- --pcie-off --dry-run
+```
+
+## What It Reports
+- Signals: Kernel-Power 41 count, GPU driver errors, WHEA events, last crash time.
+- Risk score: low / medium / high based on correlation within 10 minutes.
+- Recommended actions: power settings, driver steps, and firmware checks.
+
+## Notes
+- Windows only (uses PowerShell + `powercfg`).
+- Some fixes may require running in an elevated shell.
+
+## Manual Troubleshooting Guide (If You Prefer Not to Use Fix)
+
+Symptoms:
+- After long idle, the screen stays black or never wakes
 - Fans keep spinning / power draw stays high
 - Keyboard/mouse do not respond
 - A short power-button press cuts power immediately
 
-Likely root cause (when it only happens after long idle):
-- Power management + GPU/driver hang during idle resume
-- This is a system-level hang, not a normal "slow" freeze
+High-impact steps:
+1. Disable PCIe power saving (Control Panel -> Power Options -> Advanced):
+   - PCI Express -> Link State Power Management: Off
+2. GPU power policy:
+   - NVIDIA Control Panel -> Manage 3D settings -> Power management mode: Prefer maximum performance
+3. Disable Fast Startup:
+   - Control Panel -> Power Options -> Choose what the power buttons do -> uncheck Fast Startup
 
----
-
-## 1) Quick confirmation (10 minutes)
-
-### 1.1 Event Viewer
-Open Event Viewer -> Windows Logs -> System, check around the crash time:
-- Kernel-Power 41 (unexpected shutdown)
-- Display / nvlddmkm / amdkmdag
-- WHEA-Logger
-
-If a GPU driver error appears just before Kernel-Power 41, it strongly indicates a GPU resume hang.
-
-### 1.2 Confirm the trigger
-If it only happens after long idle / lock screen, focus on power-management fixes.
-
----
-
-## 2) Highest impact fixes (do in order)
-
-### 2.1 Temporarily disable idle sleep (to verify the cause)
-Settings -> System -> Power & Sleep:
-- Screen: Never
-- Sleep: Never
-
-If the problem disappears, the power-management path is the culprit.
-
-### 2.2 Disable PCIe power saving (key step)
-Control Panel -> Power Options -> Change plan settings -> Advanced power settings:
-- PCI Express -> Link State Power Management: Off
-- Hard disk -> Turn off hard disk after: Never
-- Processor power management -> Minimum processor state: 5% to 10%
-
-### 2.3 GPU power policy
-NVIDIA Control Panel -> Manage 3D settings (Global):
-- Power management mode: Prefer maximum performance
-- Low latency mode: Off during testing
-
-AMD: set the driver power profile to High Performance / Stable.
-
-### 2.4 Disable Fast Startup
-Control Panel -> Power Options -> Choose what the power buttons do:
-- Uncheck "Turn on fast startup"
-
----
-
-## 3) If it still happens
-
-### 3.1 Driver rollback / update (use stable official driver)
-- Avoid Windows auto-installed drivers
-- Avoid beta drivers
-
-### 3.2 BIOS / chipset update
-- Use stable versions from your motherboard or laptop vendor
-
-### 3.3 Memory / power stability (desktop focus)
-- Temporarily disable XMP
-- Reseat GPU and PCIe power cables
-- Check PSU quality/aging
-
----
-
-## 4) Verify the fix
-1. Apply the steps in section 2
-2. Leave the PC idle for 1-2 hours
-3. Try to wake it
-
-Result:
-- Wakes normally: fixed
-- Still hangs: continue with section 3
-
----
-
-## 5) Info that helps me pin it down
-- Desktop or laptop?
-- CPU + GPU model
-- Multi-monitor or hybrid graphics?
-- Any recent driver/Windows major update?
-
-If you want, I can provide a device-specific stable configuration based on your GPU model.
+If it still happens:
+- Update or roll back GPU drivers (avoid beta drivers).
+- Update BIOS / chipset drivers.
+- For desktops: check PCIe cabling and PSU stability.
