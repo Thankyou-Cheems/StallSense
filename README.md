@@ -37,6 +37,7 @@ npm run fix -- --pcie-off --dry-run
 ## Notes
 - Windows only (uses PowerShell + `powercfg`).
 - Some fixes may require running in an elevated shell.
+- Default branch: `main`.
 
 ## Manual Troubleshooting Guide (If You Prefer Not to Use Fix)
 
