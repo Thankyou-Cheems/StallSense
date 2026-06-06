@@ -1,18 +1,20 @@
 {
-  "name": "freeze-risk-analyzer",
+  "name": "stallsense",
   "version": "0.1.0",
   "private": true,
   "type": "commonjs",
   "bin": {
-    "freeze-risk-analyzer": "dist/index.js"
+    "stallsense": "dist/index.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "audit": "node dist/index.js audit",
     "analyze": "node dist/index.js analyze",
     "fix": "node dist/index.js fix --pcie-off"
   },
   "devDependencies": {
+    "@types/node": "^24.5.2",
     "typescript": "^5.4.5"
   }
 }

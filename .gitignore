@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.log
+stallsense-audit-*.json
+stallsense-smoke-report.json

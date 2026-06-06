@@ -1,61 +1,57 @@
-# Freeze Risk Analyzer (Windows)
+# StallSense
 
-A small TypeScript CLI that scans Windows Event Viewer signals (Kernel-Power 41, GPU driver errors, WHEA) to estimate the risk of idle-resume hangs and suggests targeted fixes.
+Practical Windows health audit CLI for freezes, black screens, duplicate app installs, stale startup entries, driver/filter drift, network tunnel conflicts, security-policy surprises, component-health state, and noisy event logs.
+
+The default audit is read-only. The only built-in fix is the narrow PCIe Link State Power Management toggle used for idle-resume GPU troubleshooting.
 
 ## Quick Start
+
 ```bash
 npm install
 npm run build
-npm run analyze
+npm run audit -- --days 14
 ```
 
-## CLI Usage
+## CLI
+
 ```bash
+node dist/index.js audit [--days N] [--json] [--out path] [--progress] [--probe-tools]
 node dist/index.js analyze [--days N] [--json] [--out path]
 node dist/index.js fix --pcie-off [--dry-run]
 ```
 
 Options:
-- `--days N`: How many days of System log history to scan (default: 7).
-- `--json`: Print a full JSON report to stdout.
-- `--out path`: Write the JSON report to a file.
-- `fix --pcie-off`: Disable PCIe Link State Power Management for the active power plan.
-- `--dry-run`: Print the `powercfg` commands without applying changes.
+
+- `--days N`: Event-log window, default `14`.
+- `--json`: Print the full JSON report after collection.
+- `--out path`: Write the report to a specific JSON path.
+- `--progress`: Print section timings and write `<report>.progress.log`.
+- `--probe-tools`: Also collect selected developer tool versions. Off by default because some CLIs start background services.
+- `--dry-run`: Show fix commands without applying them.
 
 Examples:
+
 ```bash
-npm run analyze -- --days 14
-npm run analyze -- --json --out report.json
+npm run audit -- --days 14
+npm run audit -- --json --out report.json
 npm run fix -- --pcie-off --dry-run
 ```
 
-## What It Reports
-- Signals: Kernel-Power 41 count, GPU driver errors, WHEA events, last crash time.
-- Risk score: low / medium / high based on correlation within 10 minutes.
-- Recommended actions: power settings, driver steps, and firmware checks.
+## What It Checks
+
+- Startup: Run/RunOnce, StartupApproved, Startup folders, services, scheduled tasks.
+- Persistence: Winlogon, IFEO debuggers, AppInit/AppCert DLLs, WMI permanent subscriptions, browser native messaging hosts, Explorer shell extensions.
+- Apps: duplicate uninstall entries, stale uninstallers/icons, broken Start Menu shortcuts, winget/scoop/choco drift.
+- Drivers/devices: service drivers, missing driver files, UpperFilters/LowerFilters, third-party kernel drivers.
+- Network: WinHTTP/user proxy, DNS, routes, Winsock, firewall profiles, Wintun/TAP/TUN/VPN adapters and services.
+- Security policy: Defender, SmartScreen, PowerShell execution policy, RDP, RemoteRegistry, SMB1, local admins, LSA anonymous-access settings.
+- Windows health: pending reboot, CBS/servicing state, Windows Update policy, Store/Gaming Services, recent CBS repair lines.
+- Stability: Kernel-Power, BugCheck, WHEA, GPU/TDR, virtual display adapters, NVIDIA/overlay processes, minidumps.
+- Developer environment: PATH duplicates/missing entries and common toolchain command resolution.
 
 ## Notes
-- Windows only (uses PowerShell + `powercfg`).
-- Some fixes may require running in an elevated shell.
-- Default branch: `main`.
 
-## Manual Troubleshooting Guide (If You Prefer Not to Use Fix)
-
-Symptoms:
-- After long idle, the screen stays black or never wakes
-- Fans keep spinning / power draw stays high
-- Keyboard/mouse do not respond
-- A short power-button press cuts power immediately
-
-High-impact steps:
-1. Disable PCIe power saving (Control Panel -> Power Options -> Advanced):
-   - PCI Express -> Link State Power Management: Off
-2. GPU power policy:
-   - NVIDIA Control Panel -> Manage 3D settings -> Power management mode: Prefer maximum performance
-3. Disable Fast Startup:
-   - Control Panel -> Power Options -> Choose what the power buttons do -> uncheck Fast Startup
-
-If it still happens:
-- Update or roll back GPU drivers (avoid beta drivers).
-- Update BIOS / chipset drivers.
-- For desktops: check PCIe cabling and PSU stability.
+- Windows only.
+- Run from an elevated terminal for the most complete report.
+- Treat findings as evidence, not automatic delete instructions. Export registry keys/tasks before manual cleanup.
+- `pc-freeze-troubleshooting.skill` packages the matching Codex skill for agent-assisted diagnosis.
