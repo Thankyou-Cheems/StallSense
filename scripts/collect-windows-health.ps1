@@ -253,7 +253,7 @@ function Invoke-Safe {
     }
 }
 
-# All known sections, in execution order. Keep in sync with the $sections.* assignments below.
+# All known sections, in execution order. Keep in sync with the $sectionData assignments below.
 $script:AllSectionNames = @(
     'System','PendingReboot','Autoruns','StartupControl','Services','CriticalServices','ScheduledTasks',
     'Persistence','BrowserNativeMessaging','ExplorerExtensions','WinlogonAndSecurity','FileAssociations',
@@ -313,8 +313,8 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 $script:DiagnosticPath = if ($DiagnosticProgress) { "$OutputPath.progress.log" } else { $null }
 if ($script:DiagnosticPath) { "DIAGNOSTIC_START $($generatedAt.ToString('o'))" | Set-Content -LiteralPath $script:DiagnosticPath -Encoding UTF8 }
 
-$sections = [ordered]@{}
-$sections.System = Invoke-Safe 'System' {
+$sectionData = [ordered]@{}
+$sectionData['System'] = Invoke-Safe 'System' {
     $os = Get-CimInstance Win32_OperatingSystem
     $computer = Get-CimInstance Win32_ComputerSystem
     $bios = Get-CimInstance Win32_BIOS
@@ -328,7 +328,7 @@ $sections.System = Invoke-Safe 'System' {
     }
 }
 
-$sections.PendingReboot = Invoke-Safe 'PendingReboot' {
+$sectionData['PendingReboot'] = Invoke-Safe 'PendingReboot' {
     $pendingRename = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
     $result = [ordered]@{
         CBSRebootPending = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
@@ -341,7 +341,7 @@ $sections.PendingReboot = Invoke-Safe 'PendingReboot' {
     $result
 }
 
-$sections.Autoruns = Invoke-Safe 'Autoruns' {
+$sectionData['Autoruns'] = Invoke-Safe 'Autoruns' {
     $autorunKeys = @(
         @{ Hive = 'HKCU'; Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' },
         @{ Hive = 'HKCU'; Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' },
@@ -382,7 +382,7 @@ $sections.Autoruns = Invoke-Safe 'Autoruns' {
     $rows.ToArray()
 }
 
-$sections.StartupControl = Invoke-Safe 'StartupControl' {
+$sectionData['StartupControl'] = Invoke-Safe 'StartupControl' {
     $startupApprovedKeys = @(
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run',
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32',
@@ -435,7 +435,7 @@ $sections.StartupControl = Invoke-Safe 'StartupControl' {
     }
 }
 
-$sections.Services = Invoke-Safe 'Services' {
+$sectionData['Services'] = Invoke-Safe 'Services' {
     $rows = New-Object System.Collections.Generic.List[object]
     foreach ($svc in Get-CimInstance Win32_Service) {
         $target = Normalize-LocalPath (Get-CommandTarget $svc.PathName)
@@ -464,7 +464,7 @@ $sections.Services = Invoke-Safe 'Services' {
     $rows.ToArray()
 }
 
-$sections.CriticalServices = Invoke-Safe 'CriticalServices' {
+$sectionData['CriticalServices'] = Invoke-Safe 'CriticalServices' {
     # Services whose broken state commonly explains "daily weirdness": no audio, no search,
     # updates stuck, no network name resolution, time drift, etc.
     $serviceExpectations = @(
@@ -519,7 +519,7 @@ $sections.CriticalServices = Invoke-Safe 'CriticalServices' {
     $rows.ToArray()
 }
 
-$sections.ScheduledTasks = Invoke-Safe 'ScheduledTasks' {
+$sectionData['ScheduledTasks'] = Invoke-Safe 'ScheduledTasks' {
     $rows = New-Object System.Collections.Generic.List[object]
     foreach ($task in Get-ScheduledTask) {
         foreach ($action in $task.Actions) {
@@ -545,7 +545,7 @@ $sections.ScheduledTasks = Invoke-Safe 'ScheduledTasks' {
     $rows.ToArray()
 }
 
-$sections.Persistence = Invoke-Safe 'Persistence' {
+$sectionData['Persistence'] = Invoke-Safe 'Persistence' {
     $result = [ordered]@{}
     $ifeoRows = New-Object System.Collections.Generic.List[object]
     foreach ($root in @(
@@ -611,7 +611,7 @@ $sections.Persistence = Invoke-Safe 'Persistence' {
     $result
 }
 
-$sections.BrowserNativeMessaging = Invoke-Safe 'BrowserNativeMessaging' {
+$sectionData['BrowserNativeMessaging'] = Invoke-Safe 'BrowserNativeMessaging' {
     $roots = @(
         'HKCU:\Software\Google\Chrome\NativeMessagingHosts',
         'HKLM:\Software\Google\Chrome\NativeMessagingHosts',
@@ -642,7 +642,7 @@ $sections.BrowserNativeMessaging = Invoke-Safe 'BrowserNativeMessaging' {
     $rows.ToArray()
 }
 
-$sections.ExplorerExtensions = Invoke-Safe 'ExplorerExtensions' {
+$sectionData['ExplorerExtensions'] = Invoke-Safe 'ExplorerExtensions' {
     $handlerRoots = @(
         'Registry::HKEY_CLASSES_ROOT\*\shellex\ContextMenuHandlers',
         'Registry::HKEY_CLASSES_ROOT\AllFilesystemObjects\shellex\ContextMenuHandlers',
@@ -687,7 +687,7 @@ $sections.ExplorerExtensions = Invoke-Safe 'ExplorerExtensions' {
     }
 }
 
-$sections.WinlogonAndSecurity = Invoke-Safe 'WinlogonAndSecurity' {
+$sectionData['WinlogonAndSecurity'] = Invoke-Safe 'WinlogonAndSecurity' {
     $uac = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue
     $winlogon = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
     $result = [ordered]@{
@@ -705,7 +705,7 @@ $sections.WinlogonAndSecurity = Invoke-Safe 'WinlogonAndSecurity' {
     $result
 }
 
-$sections.FileAssociations = Invoke-Safe 'FileAssociations' {
+$sectionData['FileAssociations'] = Invoke-Safe 'FileAssociations' {
     $result = [ordered]@{
         DotExe = Get-DefaultValue 'Registry::HKEY_CLASSES_ROOT\.exe'
         ExeOpenCommand = Get-DefaultValue 'Registry::HKEY_CLASSES_ROOT\exefile\shell\open\command'
@@ -720,7 +720,7 @@ $sections.FileAssociations = Invoke-Safe 'FileAssociations' {
     $result
 }
 
-$sections.ExplorerDailyOps = Invoke-Safe 'ExplorerDailyOps' {
+$sectionData['ExplorerDailyOps'] = Invoke-Safe 'ExplorerDailyOps' {
     $extensions = @('.txt','.pdf','.html','.htm','.jpg','.jpeg','.png','.mp4','.zip','.7z','.py','.js','.json')
     $assocRows = New-Object System.Collections.Generic.List[object]
     foreach ($ext in $extensions) {
@@ -759,7 +759,7 @@ $sections.ExplorerDailyOps = Invoke-Safe 'ExplorerDailyOps' {
     }
 }
 
-$sections.InstalledApps = Invoke-Safe 'InstalledApps' {
+$sectionData['InstalledApps'] = Invoke-Safe 'InstalledApps' {
     $uninstallRoots = @(
         @{ Scope = 'Machine64'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' },
         @{ Scope = 'Machine32'; Path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' },
@@ -915,7 +915,7 @@ $sections.InstalledApps = Invoke-Safe 'InstalledApps' {
     }
 }
 
-$sections.PathEnvironment = Invoke-Safe 'PathEnvironment' {
+$sectionData['PathEnvironment'] = Invoke-Safe 'PathEnvironment' {
     $rows = New-Object System.Collections.Generic.List[object]
     foreach ($scope in @('User','Machine')) {
         $value = [Environment]::GetEnvironmentVariable('Path', $scope)
@@ -938,7 +938,7 @@ $sections.PathEnvironment = Invoke-Safe 'PathEnvironment' {
     $rows.ToArray()
 }
 
-$sections.DeveloperToolchain = Invoke-Safe 'DeveloperToolchain' {
+$sectionData['DeveloperToolchain'] = Invoke-Safe 'DeveloperToolchain' {
     $commands = @('python','python3','py','node','npm','npx','git','docker','docker-compose','adb','dotnet','java','javac','go','rustc','cargo','uv')
     $rows = New-Object System.Collections.Generic.List[object]
     foreach ($cmd in $commands) {
@@ -987,7 +987,7 @@ $sections.DeveloperToolchain = Invoke-Safe 'DeveloperToolchain' {
     }
 }
 
-$sections.Network = Invoke-Safe 'Network' {
+$sectionData['Network'] = Invoke-Safe 'Network' {
     $internetSettings = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
     $winHttpProxy = (& netsh winhttp show proxy) -join "`n"
     $udpEndpoints = @(Get-NetUDPEndpoint -ErrorAction SilentlyContinue)
@@ -1009,7 +1009,7 @@ $sections.Network = Invoke-Safe 'Network' {
     $result
 }
 
-$sections.NetworkDeep = Invoke-Safe 'NetworkDeep' {
+$sectionData['NetworkDeep'] = Invoke-Safe 'NetworkDeep' {
     $winsockText = ''
     try { $winsockText = (& netsh winsock show catalog) -join "`n" } catch { Add-ErrorRecord 'WinsockCatalog' $_.Exception.Message }
 
@@ -1062,7 +1062,7 @@ $sections.NetworkDeep = Invoke-Safe 'NetworkDeep' {
     }
 }
 
-$sections.Defender = Invoke-Safe 'Defender' {
+$sectionData['Defender'] = Invoke-Safe 'Defender' {
     $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
     $policy = if (Test-Path $policyPath) { Get-ItemProperty $policyPath } else { $null }
     $status = $null
@@ -1080,7 +1080,7 @@ $sections.Defender = Invoke-Safe 'Defender' {
     $result
 }
 
-$sections.DefenderExclusions = Invoke-Safe 'DefenderExclusions' {
+$sectionData['DefenderExclusions'] = Invoke-Safe 'DefenderExclusions' {
     $pref = $null
     try { $pref = Get-MpPreference -ErrorAction Stop } catch { Add-ErrorRecord 'DefenderExclusions' $_.Exception.Message }
     if (-not $pref) { return $null }
@@ -1110,7 +1110,7 @@ $sections.DefenderExclusions = Invoke-Safe 'DefenderExclusions' {
     $result
 }
 
-$sections.SecurityDeep = Invoke-Safe 'SecurityDeep' {
+$sectionData['SecurityDeep'] = Invoke-Safe 'SecurityDeep' {
     $smartScreenSystem = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -ErrorAction SilentlyContinue
     $smartScreenExplorerLM = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' -ErrorAction SilentlyContinue
     $smartScreenExplorerCU = Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' -ErrorAction SilentlyContinue
@@ -1161,7 +1161,7 @@ $sections.SecurityDeep = Invoke-Safe 'SecurityDeep' {
     $result
 }
 
-$sections.WindowsUpdateAndStore = Invoke-Safe 'WindowsUpdateAndStore' {
+$sectionData['WindowsUpdateAndStore'] = Invoke-Safe 'WindowsUpdateAndStore' {
     $wuPolicy = Get-RegistryValueRows 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
     $auPolicy = Get-RegistryValueRows 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
     $servicingKeys = [ordered]@{
@@ -1217,7 +1217,7 @@ $sections.WindowsUpdateAndStore = Invoke-Safe 'WindowsUpdateAndStore' {
     }
 }
 
-$sections.Drivers = Invoke-Safe 'Drivers' {
+$sectionData['Drivers'] = Invoke-Safe 'Drivers' {
     $rows = New-Object System.Collections.Generic.List[object]
     $thirdParty = New-Object System.Collections.Generic.List[object]
     foreach ($key in Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services' -ErrorAction SilentlyContinue) {
@@ -1245,7 +1245,7 @@ $sections.Drivers = Invoke-Safe 'Drivers' {
     }
 }
 
-$sections.DeviceFilters = Invoke-Safe 'DeviceFilters' {
+$sectionData['DeviceFilters'] = Invoke-Safe 'DeviceFilters' {
     $classMap = [ordered]@{
         '{4d36e967-e325-11ce-bfc1-08002be10318}' = 'DiskDrive'
         '{4d36e965-e325-11ce-bfc1-08002be10318}' = 'CDROM'
@@ -1294,7 +1294,7 @@ $sections.DeviceFilters = Invoke-Safe 'DeviceFilters' {
     $rows.ToArray()
 }
 
-$sections.HardwareAndPower = Invoke-Safe 'HardwareAndPower' {
+$sectionData['HardwareAndPower'] = Invoke-Safe 'HardwareAndPower' {
     $graphicsDrivers = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -ErrorAction SilentlyContinue
     [ordered]@{
         GPUs = @(Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, DriverDate, Status)
@@ -1307,7 +1307,7 @@ $sections.HardwareAndPower = Invoke-Safe 'HardwareAndPower' {
     }
 }
 
-$sections.DiskAndMemoryHealth = Invoke-Safe 'DiskAndMemoryHealth' {
+$sectionData['DiskAndMemoryHealth'] = Invoke-Safe 'DiskAndMemoryHealth' {
     $isAdmin = Test-Admin
     $os = Get-CimInstance Win32_OperatingSystem
 
@@ -1422,7 +1422,7 @@ $sections.DiskAndMemoryHealth = Invoke-Safe 'DiskAndMemoryHealth' {
     }
 }
 
-$sections.TimeSyncAndHosts = Invoke-Safe 'TimeSyncAndHosts' {
+$sectionData['TimeSyncAndHosts'] = Invoke-Safe 'TimeSyncAndHosts' {
     $w32tmStatus = $null
     try { $w32tmStatus = (& w32tm /query /status 2>$null) -join "`n" } catch { }
     $timeService = Get-Service -Name W32Time -ErrorAction SilentlyContinue | Select-Object Status, StartType
@@ -1456,7 +1456,7 @@ $sections.TimeSyncAndHosts = Invoke-Safe 'TimeSyncAndHosts' {
     }
 }
 
-$sections.ReliabilityAndWER = Invoke-Safe 'ReliabilityAndWER' {
+$sectionData['ReliabilityAndWER'] = Invoke-Safe 'ReliabilityAndWER' {
     $since = (Get-Date).AddDays(-[Math]::Abs($Days))
 
     # Reliability records mirror what reliability monitor shows: app crashes, hangs, unexpected
@@ -1505,7 +1505,7 @@ $sections.ReliabilityAndWER = Invoke-Safe 'ReliabilityAndWER' {
     }
 }
 
-$sections.GpuStability = Invoke-Safe 'GpuStability' {
+$sectionData['GpuStability'] = Invoke-Safe 'GpuStability' {
     $graphicsDrivers = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -ErrorAction SilentlyContinue
     $dwm = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm' -ErrorAction SilentlyContinue
     $videoControllers = @(Get-CimInstance Win32_VideoController | Select-Object Name, PNPDeviceID, DriverVersion, DriverDate, Status)
@@ -1547,7 +1547,7 @@ $sections.GpuStability = Invoke-Safe 'GpuStability' {
     }
 }
 
-$sections.EventLogs = Invoke-Safe 'EventLogs' {
+$sectionData['EventLogs'] = Invoke-Safe 'EventLogs' {
     $since = (Get-Date).AddDays(-[Math]::Abs($Days))
     $systemEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $since; Level = 1,2,3 } -MaxEvents $MaxSystemEvents -ErrorAction SilentlyContinue)
     $appEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $since; Level = 1,2,3 } -MaxEvents $MaxAppEvents -ErrorAction SilentlyContinue)
@@ -1599,13 +1599,13 @@ $report = [ordered]@{
     GeneratedAt = $generatedAt.ToString('o')
     Days = $Days
     OutputPath = $OutputPath
-    Mode = if ($Quick) { 'Quick' } elseif ($Sections) { 'Custom' } else { 'Full' }
+    Mode = if ($Quick) { 'Quick' } elseif ($Sections -and $Sections.Count -gt 0) { 'Custom' } else { 'Full' }
     SectionsRun = @($script:SectionTimings | Select-Object -ExpandProperty Section)
     SectionsSkipped = $script:SkippedSections.ToArray()
     SectionTimings = $script:SectionTimings.ToArray()
     Findings = $script:Findings.ToArray()
     Errors = $script:Errors.ToArray()
-    Sections = $sections
+    Sections = $sectionData
 }
 
 $report | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
