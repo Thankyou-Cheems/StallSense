@@ -21,6 +21,8 @@ type AuditDigest = {
   GeneratedAt?: string;
   Mode?: string;
   Days?: number;
+  IsAdmin?: boolean;
+  Elevation?: string;
   OutputPath?: string;
   FullReportPath?: string;
   Findings?: Finding[];
@@ -193,6 +195,7 @@ function runAudit(flags: Map<string, string | boolean>, loadFullReport: boolean)
   ];
 
   if (boolFlag(flags, "quick")) psArgs.push("-Quick");
+  if (boolFlag(flags, "no-elevate")) psArgs.push("-NoElevate");
   if (boolFlag(flags, "progress")) psArgs.push("-DiagnosticProgress");
   if (boolFlag(flags, "probe-tools")) psArgs.push("-ProbeToolVersions");
 
@@ -239,6 +242,7 @@ function summarize(report: AuditDigest): void {
   console.log("StallSense Windows Health Audit");
   console.log(`Generated: ${report.GeneratedAt || "unknown"}`);
   if (report.Mode) console.log(`Mode: ${report.Mode}`);
+  if (report.Elevation) console.log(`Elevation: ${report.Elevation}${report.IsAdmin === undefined ? "" : ` (admin=${report.IsAdmin})`}`);
   console.log(`Window: last ${report.Days ?? DEFAULT_DAYS} days`);
   if (report.OutputPath || report.FullReportPath) console.log(`Report: ${report.OutputPath || report.FullReportPath}`);
   if (report.SectionsRun?.length) {
@@ -332,14 +336,14 @@ function runRepair(flags: Map<string, string | boolean>, positionals: string[]):
 
 function help(): void {
   console.log("Usage:");
-  console.log("  stallsense audit [--days N] [--quick] [--sections A,B] [--exclude-sections A,B] [--json] [--out path]");
+  console.log("  stallsense audit [--days N] [--quick] [--sections A,B] [--exclude-sections A,B] [--json] [--out path] [--no-elevate]");
   console.log("  stallsense quick [--days N] [--json] [--out path]");
   console.log("  stallsense analyze [--days N] [--json] [--out path]");
   console.log("  stallsense fix --pcie-off [--dry-run]");
   console.log("  stallsense repair [start|status|wait|log|list] [--action name] [--job-id id] [--json]");
   console.log("");
   console.log("Audit options:");
-  console.log("  --progress, --probe-tools, --max-system-events N, --max-app-events N, --event-message-max-length N");
+  console.log("  --no-elevate, --progress, --probe-tools, --max-system-events N, --max-app-events N, --event-message-max-length N");
   console.log("");
   console.log("Repair actions:");
   console.log("  dism-checkhealth, dism-scanhealth, dism-restorehealth, dism-analyze-store,");

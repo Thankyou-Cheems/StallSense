@@ -23,6 +23,8 @@ npm run build
 npm run quick -- --days 14 --json
 ```
 
+Use `--no-elevate` only when a deliberately non-admin scan is required; audit commands otherwise auto-relaunch through Windows UAC for sections that benefit from Administrator access.
+
 ## Coding Style & Naming Conventions
 - TypeScript (ES2020) with `strict: true` from `tsconfig.json`.
 - Indentation: 2 spaces; use semicolons and double quotes to match existing files.
@@ -40,4 +42,4 @@ npm run quick -- --days 14 --json
 
 ## Security & Configuration Tips
 - The CLI is Windows-only and executes PowerShell and `powercfg` commands.
-- Fix and repair commands may require an elevated shell depending on system policy; note this in PRs if behavior changes.
+- Audit commands may request Windows UAC elevation automatically; fix and repair commands may require an elevated shell depending on system policy. Note this in PRs if behavior changes.

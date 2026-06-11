@@ -14,7 +14,12 @@ param(
     [int]$MaxSystemEvents = 5000,
     [int]$MaxAppEvents = 2000,
     # Truncate event Message text in the JSON report to keep it readable and small. 0 = no truncation.
-    [int]$EventMessageMaxLength = 600
+    [int]$EventMessageMaxLength = 600,
+    # By default the collector relaunches itself elevated when selected sections benefit from
+    # Administrator access. Use this for CI or deliberately limited non-admin scans.
+    [switch]$NoElevate,
+    # Internal marker used by the elevated child process.
+    [switch]$ElevatedChild
 )
 
 $ErrorActionPreference = 'Continue'
@@ -23,6 +28,87 @@ function Test-Admin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]$identity
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-SummaryPath {
+    param([string]$ReportPath)
+    if ($ReportPath -match '(?i)\.json$') { return ($ReportPath -replace '(?i)\.json$', '.summary.json') }
+    return "$ReportPath.summary.json"
+}
+
+function ConvertTo-ProcessArgument {
+    param([string]$Value)
+    if ($null -eq $Value) { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+    return '"' + ($Value -replace '"', '\"') + '"'
+}
+
+function Get-CurrentPowerShellPath {
+    try {
+        $path = (Get-Process -Id $PID -ErrorAction Stop).Path
+        if ($path -and (Test-Path -LiteralPath $path)) { return $path }
+    } catch { }
+    return (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+}
+
+function Write-ExistingReportDigest {
+    param([string]$ReportPath)
+    $summaryPath = Get-SummaryPath $ReportPath
+    if (-not (Test-Path -LiteralPath $summaryPath)) {
+        Write-Output $ReportPath
+        return
+    }
+
+    try {
+        $summary = Get-Content -LiteralPath $summaryPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        Write-Host ("MODE={0} ADMIN={1} ELEVATION={2} SECTIONS_RUN={3} SKIPPED={4}" -f $summary.Mode, $summary.IsAdmin, $summary.Elevation, @($summary.SectionsRun).Count, @($summary.SectionsSkipped).Count)
+        Write-Host ("FINDINGS High={0} Medium={1} Low={2} Info={3} Errors={4}" -f $summary.FindingCounts.High, $summary.FindingCounts.Medium, $summary.FindingCounts.Low, $summary.FindingCounts.Info, $summary.ErrorCount)
+        foreach ($finding in @($summary.Findings | Where-Object { $_.Severity -eq 'High' } | Select-Object -First 12)) {
+            Write-Host ("HIGH [{0}] {1}" -f $finding.Category, $finding.Message)
+        }
+        Write-Host "SUMMARY=$summaryPath"
+    } catch {
+        Write-Warning "Unable to read elevated summary: $($_.Exception.Message)"
+    }
+    Write-Output $ReportPath
+}
+
+function Invoke-ElevatedCollector {
+    param([string]$ReportPath)
+
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        throw 'Cannot auto-elevate because PSCommandPath is empty.'
+    }
+
+    $childArgs = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $PSCommandPath,
+        '-ElevatedChild',
+        '-Days', [string]$Days,
+        '-OutputPath', $ReportPath,
+        '-MaxSystemEvents', [string]$MaxSystemEvents,
+        '-MaxAppEvents', [string]$MaxAppEvents,
+        '-EventMessageMaxLength', [string]$EventMessageMaxLength
+    )
+    if ($ProbeToolVersions) { $childArgs += '-ProbeToolVersions' }
+    if ($DiagnosticProgress) { $childArgs += '-DiagnosticProgress' }
+    if ($Quick) { $childArgs += '-Quick' }
+    if ($Sections -and $Sections.Count -gt 0) {
+        $childArgs += '-Sections'
+        $childArgs += @($Sections | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    }
+    if ($ExcludeSections -and $ExcludeSections.Count -gt 0) {
+        $childArgs += '-ExcludeSections'
+        $childArgs += @($ExcludeSections | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    }
+
+    $argumentLine = (@($childArgs | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' ')
+    $process = Start-Process -FilePath (Get-CurrentPowerShellPath) -ArgumentList $argumentLine -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+    if ($process.ExitCode -ne 0) {
+        throw "Elevated collector exited with code $($process.ExitCode)."
+    }
+    Write-ExistingReportDigest $ReportPath
 }
 
 function Add-ErrorRecord {
@@ -288,6 +374,41 @@ if ($ExcludeSections -and $ExcludeSections.Count -gt 0) {
     $script:EnabledSections = @($script:EnabledSections | Where-Object { $excluded -notcontains $_ })
 }
 
+$script:Findings = New-Object System.Collections.Generic.List[object]
+$script:Errors = New-Object System.Collections.Generic.List[object]
+$script:SkippedSections = New-Object System.Collections.Generic.List[object]
+$script:SectionTimings = New-Object System.Collections.Generic.List[object]
+$script:ElevationAttemptFailed = $false
+$generatedAt = Get-Date
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    $safeTime = $generatedAt.ToString('yyyyMMdd-HHmmss')
+    $OutputPath = Join-Path (Get-Location) "windows-health-audit-$safeTime.json"
+}
+$script:DiagnosticPath = if ($DiagnosticProgress) { "$OutputPath.progress.log" } else { $null }
+if ($script:DiagnosticPath) { "DIAGNOSTIC_START $($generatedAt.ToString('o'))" | Set-Content -LiteralPath $script:DiagnosticPath -Encoding UTF8 }
+
+# These sections either require Administrator rights for complete data or commonly lose important
+# evidence when run unelevated. Default behavior is to request UAC once and collect the real report
+# from an elevated child process.
+$script:AdminPreferredSections = @(
+    'Services','CriticalServices','ScheduledTasks','Persistence','ExplorerExtensions',
+    'WinlogonAndSecurity','NetworkDeep','Defender','DefenderExclusions','SecurityDeep',
+    'WindowsUpdateAndStore','Drivers','DeviceFilters','HardwareAndPower','DiskAndMemoryHealth',
+    'GpuStability','EventLogs'
+)
+$needsAdmin = @($script:EnabledSections | Where-Object { $script:AdminPreferredSections -contains $_ }).Count -gt 0
+if ($needsAdmin -and -not (Test-Admin) -and -not $NoElevate -and -not $ElevatedChild) {
+    try {
+        Write-Host 'ELEVATION_REQUESTED=1'
+        Invoke-ElevatedCollector $OutputPath
+        exit 0
+    } catch {
+        $script:ElevationAttemptFailed = $true
+        Add-ErrorRecord 'Elevation' "Automatic elevation failed or was cancelled: $($_.Exception.Message)"
+        Write-Warning "Automatic elevation failed or was cancelled; continuing non-elevated. $($_.Exception.Message)"
+    }
+}
+
 function Test-SectionEnabled {
     param([string]$Name)
     return ($script:EnabledSections -contains $Name)
@@ -300,18 +421,6 @@ function Limit-EventMessage {
     if ($Message.Length -le $EventMessageMaxLength) { return $Message }
     return ($Message.Substring(0, $EventMessageMaxLength) + ' ...[truncated]')
 }
-
-$script:Findings = New-Object System.Collections.Generic.List[object]
-$script:Errors = New-Object System.Collections.Generic.List[object]
-$script:SkippedSections = New-Object System.Collections.Generic.List[object]
-$script:SectionTimings = New-Object System.Collections.Generic.List[object]
-$generatedAt = Get-Date
-if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-    $safeTime = $generatedAt.ToString('yyyyMMdd-HHmmss')
-    $OutputPath = Join-Path (Get-Location) "windows-health-audit-$safeTime.json"
-}
-$script:DiagnosticPath = if ($DiagnosticProgress) { "$OutputPath.progress.log" } else { $null }
-if ($script:DiagnosticPath) { "DIAGNOSTIC_START $($generatedAt.ToString('o'))" | Set-Content -LiteralPath $script:DiagnosticPath -Encoding UTF8 }
 
 $sectionData = [ordered]@{}
 $sectionData['System'] = Invoke-Safe 'System' {
@@ -1595,10 +1704,25 @@ $sectionData['EventLogs'] = Invoke-Safe 'EventLogs' {
     }
 }
 
+$isAdmin = Test-Admin
+$elevationMode = if ($isAdmin -and $ElevatedChild) {
+    'AutoElevated'
+} elseif ($isAdmin) {
+    'Elevated'
+} elseif ($script:ElevationAttemptFailed) {
+    'ElevationFailed'
+} elseif ($NoElevate) {
+    'NotElevatedByRequest'
+} else {
+    'NotElevated'
+}
+
 $report = [ordered]@{
     GeneratedAt = $generatedAt.ToString('o')
     Days = $Days
     OutputPath = $OutputPath
+    IsAdmin = $isAdmin
+    Elevation = $elevationMode
     Mode = if ($Quick) { 'Quick' } elseif ($Sections -and $Sections.Count -gt 0) { 'Custom' } else { 'Full' }
     SectionsRun = @($script:SectionTimings | Select-Object -ExpandProperty Section)
     SectionsSkipped = $script:SkippedSections.ToArray()
@@ -1624,7 +1748,8 @@ $summary = [ordered]@{
     GeneratedAt = $generatedAt.ToString('o')
     Mode = $report.Mode
     Days = $Days
-    IsAdmin = Test-Admin
+    IsAdmin = $isAdmin
+    Elevation = $elevationMode
     FullReportPath = $OutputPath
     FindingCounts = $findingCounts
     Findings = $summaryFindings
@@ -1636,7 +1761,7 @@ $summary = [ordered]@{
 $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
 
 # Console digest so callers get the headline without parsing JSON.
-Write-Host ("MODE={0} ADMIN={1} SECTIONS_RUN={2} SKIPPED={3}" -f $report.Mode, (Test-Admin), $report.SectionsRun.Count, $report.SectionsSkipped.Count)
+Write-Host ("MODE={0} ADMIN={1} ELEVATION={2} SECTIONS_RUN={3} SKIPPED={4}" -f $report.Mode, $isAdmin, $elevationMode, $report.SectionsRun.Count, $report.SectionsSkipped.Count)
 Write-Host ("FINDINGS High={0} Medium={1} Low={2} Info={3} Errors={4}" -f $findingCounts.High, $findingCounts.Medium, $findingCounts.Low, $findingCounts.Info, $script:Errors.Count)
 foreach ($finding in @($script:Findings | Where-Object { $_.Severity -eq 'High' } | Select-Object -First 12)) {
     Write-Host ("HIGH [{0}] {1}" -f $finding.Category, $finding.Message)
