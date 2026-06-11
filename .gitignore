@@ -1,5 +1,7 @@
 node_modules/
 dist/
 *.log
+*.progress.log
 stallsense-audit-*.json
+windows-health-audit-*.json
 stallsense-smoke-report.json

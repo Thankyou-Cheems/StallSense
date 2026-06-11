@@ -2,7 +2,19 @@ param(
     [int]$Days = 14,
     [switch]$ProbeToolVersions,
     [switch]$DiagnosticProgress,
-    [string]$OutputPath
+    [string]$OutputPath,
+    # Run only these sections (names match section keys, e.g. 'EventLogs','InstalledApps').
+    [string[]]$Sections,
+    # Run everything except these sections.
+    [string[]]$ExcludeSections,
+    # Fast triage subset (~30-60s): skips the heaviest sections (InstalledApps, ExplorerExtensions,
+    # NetworkDeep, GpuStability, etc.) and reduces event-log volume. Use for first-pass scans
+    # and when the calling shell has a tight timeout.
+    [switch]$Quick,
+    [int]$MaxSystemEvents = 5000,
+    [int]$MaxAppEvents = 2000,
+    # Truncate event Message text in the JSON report to keep it readable and small. 0 = no truncation.
+    [int]$EventMessageMaxLength = 600
 )
 
 $ErrorActionPreference = 'Continue'
@@ -209,6 +221,10 @@ function Test-ProbablyNoiseDuplicateApp {
 
 function Invoke-Safe {
     param([string]$Area, [scriptblock]$Block)
+    if (-not (Test-SectionEnabled $Area)) {
+        $script:SkippedSections.Add($Area) | Out-Null
+        return $null
+    }
     $sw = [Diagnostics.Stopwatch]::StartNew()
     if ($DiagnosticProgress) {
         Write-Host "SECTION_START $Area"
@@ -217,6 +233,7 @@ function Invoke-Safe {
     try {
         $result = & $Block
         $sw.Stop()
+        $script:SectionTimings.Add([pscustomobject]@{ Section = $Area; Seconds = [Math]::Round($sw.Elapsed.TotalSeconds, 3); Status = 'OK' }) | Out-Null
         if ($DiagnosticProgress) {
             $line = "SECTION_DONE {0} {1:n3}s" -f $Area, $sw.Elapsed.TotalSeconds
             Write-Host $line
@@ -225,6 +242,7 @@ function Invoke-Safe {
         return $result
     } catch {
         $sw.Stop()
+        $script:SectionTimings.Add([pscustomobject]@{ Section = $Area; Seconds = [Math]::Round($sw.Elapsed.TotalSeconds, 3); Status = 'Error' }) | Out-Null
         Add-ErrorRecord $Area $_.Exception.Message
         if ($DiagnosticProgress) {
             $line = "SECTION_ERROR {0} {1:n3}s" -f $Area, $sw.Elapsed.TotalSeconds
@@ -235,8 +253,58 @@ function Invoke-Safe {
     }
 }
 
+# All known sections, in execution order. Keep in sync with the $sections.* assignments below.
+$script:AllSectionNames = @(
+    'System','PendingReboot','Autoruns','StartupControl','Services','CriticalServices','ScheduledTasks',
+    'Persistence','BrowserNativeMessaging','ExplorerExtensions','WinlogonAndSecurity','FileAssociations',
+    'ExplorerDailyOps','InstalledApps','PathEnvironment','DeveloperToolchain','Network','NetworkDeep',
+    'Defender','DefenderExclusions','SecurityDeep','WindowsUpdateAndStore','Drivers','DeviceFilters',
+    'HardwareAndPower','DiskAndMemoryHealth','GpuStability','TimeSyncAndHosts','ReliabilityAndWER','EventLogs'
+)
+
+# Fast triage subset. Designed to finish well under typical agent shell timeouts.
+$script:QuickSectionNames = @(
+    'System','PendingReboot','Autoruns','StartupControl','Services','CriticalServices','ScheduledTasks',
+    'Persistence','WinlogonAndSecurity','FileAssociations','PathEnvironment','Network','Defender',
+    'DiskAndMemoryHealth','ReliabilityAndWER','EventLogs'
+)
+
+$script:EnabledSections = $script:AllSectionNames
+if ($Quick) {
+    $script:EnabledSections = $script:QuickSectionNames
+    if (-not $PSBoundParameters.ContainsKey('MaxSystemEvents')) { $MaxSystemEvents = 1500 }
+    if (-not $PSBoundParameters.ContainsKey('MaxAppEvents')) { $MaxAppEvents = 800 }
+}
+if ($Sections -and $Sections.Count -gt 0) {
+    $requested = @($Sections | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $unknown = @($requested | Where-Object { $script:AllSectionNames -notcontains $_ })
+    if ($unknown.Count -gt 0) {
+        Write-Warning ("Unknown section name(s): {0}. Valid: {1}" -f ($unknown -join ', '), ($script:AllSectionNames -join ', '))
+    }
+    $script:EnabledSections = @($script:AllSectionNames | Where-Object { $requested -contains $_ })
+}
+if ($ExcludeSections -and $ExcludeSections.Count -gt 0) {
+    $excluded = @($ExcludeSections | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $script:EnabledSections = @($script:EnabledSections | Where-Object { $excluded -notcontains $_ })
+}
+
+function Test-SectionEnabled {
+    param([string]$Name)
+    return ($script:EnabledSections -contains $Name)
+}
+
+function Limit-EventMessage {
+    param([AllowNull()][string]$Message)
+    if ($null -eq $Message) { return $null }
+    if ($EventMessageMaxLength -le 0) { return $Message }
+    if ($Message.Length -le $EventMessageMaxLength) { return $Message }
+    return ($Message.Substring(0, $EventMessageMaxLength) + ' ...[truncated]')
+}
+
 $script:Findings = New-Object System.Collections.Generic.List[object]
 $script:Errors = New-Object System.Collections.Generic.List[object]
+$script:SkippedSections = New-Object System.Collections.Generic.List[object]
+$script:SectionTimings = New-Object System.Collections.Generic.List[object]
 $generatedAt = Get-Date
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $safeTime = $generatedAt.ToString('yyyyMMdd-HHmmss')
@@ -391,6 +459,61 @@ $sections.Services = Invoke-Safe 'Services' {
         }
         if ($unquoted) {
             Add-Finding 'Medium' 'Services' "Service path with spaces is unquoted: $($svc.Name)" $row 'Quote the ImagePath or use sc.exe config carefully.'
+        }
+    }
+    $rows.ToArray()
+}
+
+$sections.CriticalServices = Invoke-Safe 'CriticalServices' {
+    # Services whose broken state commonly explains "daily weirdness": no audio, no search,
+    # updates stuck, no network name resolution, time drift, etc.
+    $serviceExpectations = @(
+        @{ Name = 'RpcSs';                MustRun = $true;  Why = 'RPC endpoint mapper; nothing works without it' },
+        @{ Name = 'Winmgmt';              MustRun = $true;  Why = 'WMI; many tools and this audit depend on it' },
+        @{ Name = 'EventLog';             MustRun = $true;  Why = 'Event logging; diagnostics blind without it' },
+        @{ Name = 'Dnscache';             MustRun = $true;  Why = 'DNS client cache; resolution failures when stopped' },
+        @{ Name = 'Dhcp';                 MustRun = $false; Why = 'DHCP client; needed unless all-static addressing' },
+        @{ Name = 'BFE';                  MustRun = $true;  Why = 'Base Filtering Engine; firewall/IPsec/VPN depend on it' },
+        @{ Name = 'MpsSvc';               MustRun = $false; Why = 'Windows Firewall service' },
+        @{ Name = 'wscsvc';               MustRun = $false; Why = 'Security Center; status reporting' },
+        @{ Name = 'Schedule';             MustRun = $true;  Why = 'Task Scheduler; maintenance and app updaters break' },
+        @{ Name = 'ProfSvc';              MustRun = $true;  Why = 'User Profile Service; logon issues when broken' },
+        @{ Name = 'Audiosrv';             MustRun = $false; Why = 'Windows Audio; no sound when stopped' },
+        @{ Name = 'AudioEndpointBuilder'; MustRun = $false; Why = 'Audio endpoint enumeration' },
+        @{ Name = 'Themes';               MustRun = $false; Why = 'Visual styles; classic-looking UI when stopped' },
+        @{ Name = 'wuauserv';             MustRun = $false; Why = 'Windows Update; updates stuck when disabled' },
+        @{ Name = 'BITS';                 MustRun = $false; Why = 'Background transfer; WU and Store downloads' },
+        @{ Name = 'cryptsvc';             MustRun = $false; Why = 'Cryptographic services; WU catalog and signing' },
+        @{ Name = 'msiserver';            MustRun = $false; Why = 'Windows Installer; Manual start is normal' },
+        @{ Name = 'TrustedInstaller';     MustRun = $false; Why = 'Windows Modules Installer; Manual start is normal' },
+        @{ Name = 'WSearch';              MustRun = $false; Why = 'Windows Search; Start Menu / Explorer search' },
+        @{ Name = 'Spooler';              MustRun = $false; Why = 'Print Spooler; printing breaks when stopped' },
+        @{ Name = 'LanmanWorkstation';    MustRun = $false; Why = 'SMB client; network shares' },
+        @{ Name = 'W32Time';              MustRun = $false; Why = 'Time sync; TLS/auth failures on large clock skew' },
+        @{ Name = 'DPS';                  MustRun = $false; Why = 'Diagnostic Policy Service' },
+        @{ Name = 'SysMain';              MustRun = $false; Why = 'Prefetch/Superfetch; informational' }
+    )
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($expectation in $serviceExpectations) {
+        $svc = Get-Service -Name $expectation.Name -ErrorAction SilentlyContinue
+        $row = [pscustomobject]@{
+            Name = $expectation.Name
+            Present = [bool]$svc
+            Status = if ($svc) { [string]$svc.Status } else { $null }
+            StartType = if ($svc) { [string]$svc.StartType } else { $null }
+            Why = $expectation.Why
+        }
+        $rows.Add($row) | Out-Null
+        if (-not $svc) {
+            if ($expectation.MustRun) {
+                Add-Finding 'High' 'CriticalServices' "Core service is missing: $($expectation.Name)" $row 'A missing core service suggests heavy tampering or corruption; investigate before other fixes.'
+            }
+            continue
+        }
+        if ($expectation.MustRun -and $svc.Status -ne 'Running') {
+            Add-Finding 'High' 'CriticalServices' "Core service is not running: $($expectation.Name)" $row 'Start the service and check System log 7000/7031/7034 entries for why it stopped.'
+        } elseif (-not $expectation.MustRun -and $svc.StartType -eq 'Disabled' -and $expectation.Name -in @('wuauserv','BITS','cryptsvc','Audiosrv','Dnscache','MpsSvc','wscsvc','WSearch','Schedule')) {
+            Add-Finding 'Medium' 'CriticalServices' "Commonly-needed service is disabled: $($expectation.Name)" $row 'Disabled state here is usually "optimizer" tool damage; restore default start type unless intentionally hardened.'
         }
     }
     $rows.ToArray()
@@ -957,6 +1080,36 @@ $sections.Defender = Invoke-Safe 'Defender' {
     $result
 }
 
+$sections.DefenderExclusions = Invoke-Safe 'DefenderExclusions' {
+    $pref = $null
+    try { $pref = Get-MpPreference -ErrorAction Stop } catch { Add-ErrorRecord 'DefenderExclusions' $_.Exception.Message }
+    if (-not $pref) { return $null }
+    $result = [ordered]@{
+        Note = if (-not (Test-Admin)) { 'Non-elevated shells may see empty exclusion lists even when exclusions exist.' } else { $null }
+        ExclusionPath = @($pref.ExclusionPath)
+        ExclusionProcess = @($pref.ExclusionProcess)
+        ExclusionExtension = @($pref.ExclusionExtension)
+        DisableBehaviorMonitoring = $pref.DisableBehaviorMonitoring
+        DisableScriptScanning = $pref.DisableScriptScanning
+        SubmitSamplesConsent = $pref.SubmitSamplesConsent
+    }
+    $broad = @($result.ExclusionPath | Where-Object {
+        $_ -match '^[A-Za-z]:\\?$' -or
+        $_ -match '^[A-Za-z]:\\(Windows|Users|Program Files( \(x86\))?|ProgramData)\\?$' -or
+        $_ -eq '*'
+    })
+    if ($broad.Count -gt 0) {
+        Add-Finding 'High' 'SecurityPolicy' 'Defender has overly broad path exclusions (drive root or core system folder).' $broad 'Broad exclusions are a common malware-persistence trick; narrow or remove them after verifying who added them.'
+    }
+    if (@($result.ExclusionExtension) -contains 'exe' -or @($result.ExclusionExtension) -contains '.exe') {
+        Add-Finding 'High' 'SecurityPolicy' 'Defender excludes the .exe extension from scanning.' $result.ExclusionExtension 'Remove this exclusion; it effectively disables executable scanning.'
+    }
+    if ($pref.DisableBehaviorMonitoring -eq $true -or $pref.DisableScriptScanning -eq $true) {
+        Add-Finding 'Medium' 'SecurityPolicy' 'Defender behavior monitoring or script scanning is disabled.' $result 'Re-enable unless a managed baseline intentionally configures this.'
+    }
+    $result
+}
+
 $sections.SecurityDeep = Invoke-Safe 'SecurityDeep' {
     $smartScreenSystem = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -ErrorAction SilentlyContinue
     $smartScreenExplorerLM = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' -ErrorAction SilentlyContinue
@@ -1154,6 +1307,204 @@ $sections.HardwareAndPower = Invoke-Safe 'HardwareAndPower' {
     }
 }
 
+$sections.DiskAndMemoryHealth = Invoke-Safe 'DiskAndMemoryHealth' {
+    $isAdmin = Test-Admin
+    $os = Get-CimInstance Win32_OperatingSystem
+
+    # Volume free space: low system-drive space is one of the most common causes of
+    # slowness, update failures, and app crashes, and is cheap to detect.
+    $volumeRows = New-Object System.Collections.Generic.List[object]
+    foreach ($vol in @(Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' })) {
+        $freePct = if ($vol.Size -gt 0) { [Math]::Round(100.0 * $vol.SizeRemaining / $vol.Size, 1) } else { $null }
+        $dirty = $null
+        if ($isAdmin) {
+            try {
+                $dirtyText = (& fsutil dirty query "$($vol.DriveLetter):" 2>$null) -join ' '
+                if ($dirtyText -match 'is dirty|为脏') { $dirty = $true }
+                elseif ($dirtyText -match 'not dirty|不脏|NOT dirty') { $dirty = $false }
+            } catch { }
+        }
+        $row = [pscustomobject]@{
+            DriveLetter = [string]$vol.DriveLetter
+            Label = $vol.FileSystemLabel
+            FileSystem = $vol.FileSystem
+            HealthStatus = [string]$vol.HealthStatus
+            SizeGB = [Math]::Round($vol.Size / 1GB, 1)
+            FreeGB = [Math]::Round($vol.SizeRemaining / 1GB, 1)
+            FreePercent = $freePct
+            DirtyBit = $dirty
+        }
+        $volumeRows.Add($row) | Out-Null
+        $isSystemDrive = ("$($vol.DriveLetter):" -eq $env:SystemDrive)
+        if ($null -ne $freePct -and (($freePct -lt 5) -or ($isSystemDrive -and $row.FreeGB -lt 10))) {
+            Add-Finding 'High' 'Disk' "Volume $($row.DriveLetter): is critically low on space ($($row.FreeGB) GB / $freePct%)." $row 'Free space before any repair work; Windows Update and component repair need several GB of headroom.'
+        } elseif ($null -ne $freePct -and $freePct -lt 12 -and $isSystemDrive) {
+            Add-Finding 'Medium' 'Disk' "System volume free space is low ($($row.FreeGB) GB / $freePct%)." $row 'Run Disk Cleanup / Storage Sense; low space degrades performance and update reliability.'
+        }
+        if ($dirty -eq $true) {
+            Add-Finding 'High' 'Disk' "Volume $($row.DriveLetter): has the dirty bit set." $row 'Schedule chkdsk (autochk runs at next boot); a persistently dirty volume can cause hangs and corruption.'
+        }
+        if ($vol.HealthStatus -and [string]$vol.HealthStatus -ne 'Healthy') {
+            Add-Finding 'High' 'Disk' "Volume $($row.DriveLetter): health status is $($vol.HealthStatus)." $row 'Back up data first, then investigate disk health.'
+        }
+    }
+
+    # Physical disk SMART-ish reliability counters (needs elevation on most systems).
+    $reliabilityRows = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($disk in @(Get-PhysicalDisk -ErrorAction Stop)) {
+            $counter = $null
+            try { $counter = $disk | Get-StorageReliabilityCounter -ErrorAction Stop } catch { }
+            $row = [pscustomobject]@{
+                FriendlyName = $disk.FriendlyName
+                MediaType = [string]$disk.MediaType
+                HealthStatus = [string]$disk.HealthStatus
+                OperationalStatus = ([string[]]$disk.OperationalStatus) -join ','
+                SizeGB = [Math]::Round($disk.Size / 1GB, 1)
+                Wear = if ($counter) { $counter.Wear } else { $null }
+                TemperatureC = if ($counter) { $counter.Temperature } else { $null }
+                ReadErrorsUncorrected = if ($counter) { $counter.ReadErrorsUncorrected } else { $null }
+                WriteErrorsUncorrected = if ($counter) { $counter.WriteErrorsUncorrected } else { $null }
+                PowerOnHours = if ($counter -and $counter.PowerOnHours) { [int]$counter.PowerOnHours.TotalHours } else { $null }
+            }
+            $reliabilityRows.Add($row) | Out-Null
+            if ($disk.HealthStatus -and [string]$disk.HealthStatus -ne 'Healthy') {
+                Add-Finding 'High' 'Disk' "Physical disk health is $($disk.HealthStatus): $($disk.FriendlyName)" $row 'Back up immediately; failing storage explains freezes, hangs, and corruption better than registry issues.'
+            }
+            if (($row.ReadErrorsUncorrected -gt 0) -or ($row.WriteErrorsUncorrected -gt 0)) {
+                Add-Finding 'High' 'Disk' "Disk reports uncorrected read/write errors: $($disk.FriendlyName)" $row 'Treat as hardware evidence; back up and plan replacement.'
+            }
+            if ($null -ne $row.Wear -and $row.Wear -ge 80) {
+                Add-Finding 'Medium' 'Disk' "SSD wear level is high ($($row.Wear)%): $($disk.FriendlyName)" $row 'Plan replacement; heavily worn SSDs can stall under write load.'
+            }
+        }
+    } catch { Add-ErrorRecord 'StorageReliability' $_.Exception.Message }
+
+    # Memory and commit pressure (point-in-time snapshot; treat as a hint, not proof).
+    $totalMB = [double]$os.TotalVisibleMemorySize / 1KB
+    $freeMB = [double]$os.FreePhysicalMemory / 1KB
+    $commitTotalMB = [double]$os.TotalVirtualMemorySize / 1KB
+    $commitFreeMB = [double]$os.FreeVirtualMemory / 1KB
+    $commitUsedPct = if ($commitTotalMB -gt 0) { [Math]::Round(100.0 * ($commitTotalMB - $commitFreeMB) / $commitTotalMB, 1) } else { $null }
+    $pageFiles = @(Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue | Select-Object Name, AllocatedBaseSize, CurrentUsage, PeakUsage)
+    $autoManaged = (Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile
+    $memory = [ordered]@{
+        TotalPhysicalMB = [int]$totalMB
+        FreePhysicalMB = [int]$freeMB
+        CommitUsedPercent = $commitUsedPct
+        AutomaticManagedPagefile = $autoManaged
+        PageFiles = $pageFiles
+    }
+    if ($null -ne $commitUsedPct -and $commitUsedPct -ge 90) {
+        Add-Finding 'Medium' 'Memory' "Commit charge is very high ($commitUsedPct%)." $memory 'Identify the top memory consumers; commit exhaustion causes app crashes and system stalls.'
+    }
+    if (-not $autoManaged -and $pageFiles.Count -eq 0) {
+        Add-Finding 'Medium' 'Memory' 'Page file appears disabled.' $memory 'A disabled page file plus a memory spike crashes apps; re-enable system-managed paging unless intentionally configured.'
+    }
+
+    # Windows Memory Diagnostic results, if the user ever ran mdsched.
+    $memDiag = @()
+    try {
+        $memDiag = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results' } -MaxEvents 5 -ErrorAction Stop |
+            Select-Object TimeCreated, Id, @{n='Message';e={ Limit-EventMessage $_.Message }})
+        foreach ($evt in $memDiag) {
+            if ($evt.Id -eq 1202) {
+                Add-Finding 'High' 'Memory' 'Windows Memory Diagnostic previously detected RAM errors.' $evt 'Treat RAM as suspect: re-test (memtest86), reseat modules, disable XMP for testing.'
+            }
+        }
+    } catch { }
+
+    [ordered]@{
+        Volumes = $volumeRows.ToArray()
+        PhysicalDiskReliability = $reliabilityRows.ToArray()
+        Memory = $memory
+        MemoryDiagnosticEvents = $memDiag
+    }
+}
+
+$sections.TimeSyncAndHosts = Invoke-Safe 'TimeSyncAndHosts' {
+    $w32tmStatus = $null
+    try { $w32tmStatus = (& w32tm /query /status 2>$null) -join "`n" } catch { }
+    $timeService = Get-Service -Name W32Time -ErrorAction SilentlyContinue | Select-Object Status, StartType
+
+    $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+    $hostsEntries = @()
+    try {
+        if (Test-Path -LiteralPath $hostsPath) {
+            $hostsEntries = @(Get-Content -LiteralPath $hostsPath -ErrorAction Stop |
+                Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*#' } |
+                ForEach-Object { $_.Trim() })
+        }
+    } catch { Add-ErrorRecord 'HostsFile' $_.Exception.Message }
+
+    $suspiciousHosts = @($hostsEntries | Where-Object {
+        $_ -match '(?i)\b(microsoft|windowsupdate|windows\.com|defender|google|github|apple|mozilla|adobe|steampowered|epicgames|nvidia|amd\.com|intel)\b' -and
+        $_ -notmatch '^\s*(127\.0\.0\.1|::1)\s+(localhost|localhost\.localdomain)\b'
+    })
+    if ($suspiciousHosts.Count -gt 0) {
+        Add-Finding 'Medium' 'Network' 'Hosts file overrides well-known vendor domains.' $suspiciousHosts 'Common with activation cracks and ad blockers; can break updates, Defender, and app sign-in. Verify each line is intentional.'
+    } elseif ($hostsEntries.Count -gt 50) {
+        Add-Finding 'Low' 'Network' "Hosts file has many entries ($($hostsEntries.Count))." ($hostsEntries | Select-Object -First 20) 'Large hosts lists (ad-block style) are usually intentional but can slow DNS-dependent lookups on some setups.'
+    }
+
+    [ordered]@{
+        TimeServiceState = $timeService
+        W32tmStatus = $w32tmStatus
+        HostsEntryCount = $hostsEntries.Count
+        HostsEntries = @($hostsEntries | Select-Object -First 100)
+        SuspiciousHostsEntries = $suspiciousHosts
+    }
+}
+
+$sections.ReliabilityAndWER = Invoke-Safe 'ReliabilityAndWER' {
+    $since = (Get-Date).AddDays(-[Math]::Abs($Days))
+
+    # Reliability records mirror what reliability monitor shows: app crashes, hangs, unexpected
+    # shutdowns, and install events, with timestamps that make correlation easy.
+    $reliability = @()
+    try {
+        $reliability = @(Get-CimInstance Win32_ReliabilityRecords -ErrorAction Stop |
+            Where-Object { $_.TimeGenerated -ge $since } |
+            Sort-Object TimeGenerated -Descending |
+            Select-Object -First 80 TimeGenerated, SourceName, EventIdentifier, ProductName,
+                @{n='Message';e={ Limit-EventMessage $_.Message }})
+    } catch { Add-ErrorRecord 'ReliabilityRecords' $_.Exception.Message }
+
+    # WER report folders: a quick census of which apps are actually crashing.
+    $werRoots = @("$env:ProgramData\Microsoft\Windows\WER\ReportArchive", "$env:ProgramData\Microsoft\Windows\WER\ReportQueue")
+    $werRecent = New-Object System.Collections.Generic.List[object]
+    foreach ($root in $werRoots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -ge $since } | Sort-Object LastWriteTime -Descending | Select-Object -First 40)) {
+            $werRecent.Add([pscustomobject]@{ Root = $root; Name = $dir.Name; LastWriteTime = $dir.LastWriteTime }) | Out-Null
+        }
+    }
+    $werByApp = @($werRecent | ForEach-Object {
+        if ($_.Name -match '^(AppCrash|AppHang|CrashDump|Kernel)_([^_]+)_') { [pscustomobject]@{ Kind = $Matches[1]; App = $Matches[2] } }
+    } | Group-Object App | Sort-Object Count -Descending | Select-Object -First 15 Count, Name)
+    foreach ($group in $werByApp) {
+        if ($group.Count -ge 5) {
+            Add-Finding 'Medium' 'Stability' "App is crashing/hanging repeatedly per WER: $($group.Name) ($($group.Count) reports in window)." $group 'Correlate with Application Error 1000 / Hang 1002 events; consider cache reset or reinstall of this app.'
+        }
+    }
+
+    # LiveKernelReports: GPU/watchdog live dumps that do not show up as full bugchecks.
+    $liveKernel = @(Get-ChildItem 'C:\Windows\LiveKernelReports' -Recurse -Filter '*.dmp' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 10 FullName, Length, LastWriteTime)
+    if (@($liveKernel | Where-Object { $_.LastWriteTime -ge $since }).Count -gt 0) {
+        Add-Finding 'Medium' 'Stability' 'Recent LiveKernelReports dumps exist (often WATCHDOG/GPU related).' $liveKernel 'Correlate dump times with freezes; these capture hangs that never became blue screens.'
+    }
+
+    [ordered]@{
+        Since = $since
+        ReliabilityRecords = $reliability
+        RecentWERReports = $werRecent.ToArray()
+        WERReportsByApp = $werByApp
+        LiveKernelReports = $liveKernel
+    }
+}
+
 $sections.GpuStability = Invoke-Safe 'GpuStability' {
     $graphicsDrivers = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -ErrorAction SilentlyContinue
     $dwm = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm' -ErrorAction SilentlyContinue
@@ -1198,15 +1549,15 @@ $sections.GpuStability = Invoke-Safe 'GpuStability' {
 
 $sections.EventLogs = Invoke-Safe 'EventLogs' {
     $since = (Get-Date).AddDays(-[Math]::Abs($Days))
-    $systemEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $since; Level = 1,2,3 } -MaxEvents 5000 -ErrorAction SilentlyContinue)
-    $appEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $since; Level = 1,2,3 } -MaxEvents 2000 -ErrorAction SilentlyContinue)
+    $systemEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $since; Level = 1,2,3 } -MaxEvents $MaxSystemEvents -ErrorAction SilentlyContinue)
+    $appEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $since; Level = 1,2,3 } -MaxEvents $MaxAppEvents -ErrorAction SilentlyContinue)
     $systemSummary = @($systemEvents | Group-Object ProviderName, Id | Sort-Object Count -Descending | Select-Object -First 30 Count, Name)
     $appSummary = @($appEvents | Group-Object ProviderName, Id | Sort-Object Count -Descending | Select-Object -First 20 Count, Name)
     $notableSystem = @($systemEvents | Where-Object {
         $_.Id -in 41,6008,4101,14,17,18,19,20,45,46,47,7000,7009,7031,7034,1001 -or
         $_.ProviderName -match 'nvlddmkm|amdkmdag|WHEA|BugCheck|Kernel-Power'
-    } | Sort-Object TimeCreated | Select-Object TimeCreated, Id, ProviderName, LevelDisplayName, Message)
-    $notableApp = @($appEvents | Where-Object { $_.Id -in 1000,1001,1002,1026 } | Sort-Object TimeCreated | Select-Object -Last 100 TimeCreated, Id, ProviderName, LevelDisplayName, Message)
+    } | Sort-Object TimeCreated | Select-Object -Last 300 TimeCreated, Id, ProviderName, LevelDisplayName, @{n='Message';e={ Limit-EventMessage $_.Message }})
+    $notableApp = @($appEvents | Where-Object { $_.Id -in 1000,1001,1002,1026 } | Sort-Object TimeCreated | Select-Object -Last 100 TimeCreated, Id, ProviderName, LevelDisplayName, @{n='Message';e={ Limit-EventMessage $_.Message }})
     $kp41 = @($notableSystem | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and $_.Id -eq 41 })
     $gpu = @($notableSystem | Where-Object { $_.ProviderName -match 'nvlddmkm|amdkmdag' -or $_.Id -eq 4101 })
     $whea = @($notableSystem | Where-Object { $_.ProviderName -match 'WHEA' })
@@ -1223,7 +1574,7 @@ $sections.EventLogs = Invoke-Safe 'EventLogs' {
             ProviderName = $_.ProviderName
             BugCheckCode = $code
             DumpPath = $dump
-            Message = $_.Message
+            Message = Limit-EventMessage $_.Message
         }
     })
     if ($kp41.Count -gt 0) { Add-Finding 'High' 'Stability' "Unexpected shutdown/reboot events found: $($kp41.Count)." ($kp41 | Select-Object -Last 10) 'Correlate with BugCheck, GPU, WHEA, and power events before changing registry settings.' }
@@ -1248,10 +1599,47 @@ $report = [ordered]@{
     GeneratedAt = $generatedAt.ToString('o')
     Days = $Days
     OutputPath = $OutputPath
+    Mode = if ($Quick) { 'Quick' } elseif ($Sections) { 'Custom' } else { 'Full' }
+    SectionsRun = @($script:SectionTimings | Select-Object -ExpandProperty Section)
+    SectionsSkipped = $script:SkippedSections.ToArray()
+    SectionTimings = $script:SectionTimings.ToArray()
     Findings = $script:Findings.ToArray()
     Errors = $script:Errors.ToArray()
     Sections = $sections
 }
 
 $report | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
+
+# Compact summary: read this first. It carries every finding (without bulky evidence payloads),
+# so the full report only needs to be opened for the sections under investigation.
+$severityOrder = @{ High = 0; Medium = 1; Low = 2; Info = 3 }
+$findingCounts = [ordered]@{ High = 0; Medium = 0; Low = 0; Info = 0 }
+foreach ($finding in $script:Findings) {
+    if ($findingCounts.Contains($finding.Severity)) { $findingCounts[$finding.Severity] = $findingCounts[$finding.Severity] + 1 }
+}
+$summaryFindings = @($script:Findings | Sort-Object { $severityOrder[$_.Severity] } |
+    Select-Object Severity, Category, Message, Recommendation)
+$summaryPath = ("$OutputPath" -replace '\.json$', '') + '.summary.json'
+$summary = [ordered]@{
+    GeneratedAt = $generatedAt.ToString('o')
+    Mode = $report.Mode
+    Days = $Days
+    IsAdmin = Test-Admin
+    FullReportPath = $OutputPath
+    FindingCounts = $findingCounts
+    Findings = $summaryFindings
+    SectionsRun = $report.SectionsRun
+    SectionsSkipped = $report.SectionsSkipped
+    SlowestSections = @($script:SectionTimings | Sort-Object Seconds -Descending | Select-Object -First 8)
+    ErrorCount = $script:Errors.Count
+}
+$summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
+
+# Console digest so callers get the headline without parsing JSON.
+Write-Host ("MODE={0} ADMIN={1} SECTIONS_RUN={2} SKIPPED={3}" -f $report.Mode, (Test-Admin), $report.SectionsRun.Count, $report.SectionsSkipped.Count)
+Write-Host ("FINDINGS High={0} Medium={1} Low={2} Info={3} Errors={4}" -f $findingCounts.High, $findingCounts.Medium, $findingCounts.Low, $findingCounts.Info, $script:Errors.Count)
+foreach ($finding in @($script:Findings | Where-Object { $_.Severity -eq 'High' } | Select-Object -First 12)) {
+    Write-Host ("HIGH [{0}] {1}" -f $finding.Category, $finding.Message)
+}
+Write-Host "SUMMARY=$summaryPath"
 Write-Output $OutputPath

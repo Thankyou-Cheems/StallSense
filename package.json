@@ -10,8 +10,10 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "audit": "node dist/index.js audit",
+    "quick": "node dist/index.js quick",
     "analyze": "node dist/index.js analyze",
-    "fix": "node dist/index.js fix --pcie-off"
+    "fix": "node dist/index.js fix --pcie-off",
+    "repair": "node dist/index.js repair"
   },
   "devDependencies": {
     "@types/node": "^24.5.2",
