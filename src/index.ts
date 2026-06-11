@@ -347,7 +347,7 @@ function help(): void {
   console.log("");
   console.log("Repair actions:");
   console.log("  dism-checkhealth, dism-scanhealth, dism-restorehealth, dism-analyze-store,");
-  console.log("  dism-component-cleanup, sfc-scannow, chkdsk-schedule, wu-reset, winsock-reset, dns-flush");
+  console.log("  dism-component-cleanup, sfc-verifyonly, sfc-scannow, chkdsk-scan, chkdsk-schedule, wu-reset, winsock-reset, dns-flush");
   console.log("");
   console.log("Examples:");
   console.log("  stallsense audit --days 14");

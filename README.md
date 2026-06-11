@@ -53,7 +53,7 @@ npm run fix -- --pcie-off --dry-run
 Repair actions:
 
 - `dism-checkhealth`, `dism-scanhealth`, `dism-restorehealth`, `dism-analyze-store`, `dism-component-cleanup`
-- `sfc-scannow`, `chkdsk-schedule`, `wu-reset`, `winsock-reset`, `dns-flush`
+- `sfc-verifyonly`, `sfc-scannow`, `chkdsk-scan`, `chkdsk-schedule`, `wu-reset`, `winsock-reset`, `dns-flush`
 
 Use `repair start` to launch, then `repair status`, `repair wait --timeout 50`, or `repair log` to inspect progress. Most repair actions require an elevated terminal; `dns-flush` does not.
 

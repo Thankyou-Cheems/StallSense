@@ -37,7 +37,9 @@ param(
         'dism-restorehealth',    # 10-45+ min: repair component store (may download from WU)
         'dism-analyze-store',    # 1-5 min: component store size / cleanup recommendation
         'dism-component-cleanup',# 10-60 min: WinSxS cleanup
+        'sfc-verifyonly',        # 5-30 min: system file check only, no repair
         'sfc-scannow',           # 5-30 min: system file check + repair from store
+        'chkdsk-scan',           # 1-10 min: online NTFS scan, no scheduled repair
         'chkdsk-schedule',       # seconds: schedules autochk for next boot on -Drive
         'wu-reset',              # 1-3 min: stop WU services, rename SoftwareDistribution/catroot2, restart
         'winsock-reset',         # seconds: netsh winsock reset (reboot required)
@@ -56,7 +58,9 @@ param(
     # calling shell's timeout; call wait repeatedly instead of raising it.
     [int]$TimeoutSeconds = 50,
     [int]$PollSeconds = 5,
-    [switch]$AsJson
+    [switch]$AsJson,
+    # Internal marker used when the runner relaunches itself through UAC.
+    [switch]$ElevatedChild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,6 +76,36 @@ function Get-StateRoot {
     return $root
 }
 
+function Get-StateRoots {
+    $roots = New-Object System.Collections.Generic.List[string]
+    $programDataRoot = Join-Path $env:ProgramData 'pc-health-repair'
+    $localRoot = Join-Path $env:LOCALAPPDATA 'pc-health-repair'
+    foreach ($root in @($programDataRoot, $localRoot)) {
+        if ([string]::IsNullOrWhiteSpace($root)) { continue }
+        if ($roots -contains $root) { continue }
+        try {
+            if (Test-Path -LiteralPath $root) { $roots.Add($root) | Out-Null }
+        } catch { }
+    }
+    if ($roots.Count -eq 0) { $roots.Add((Get-StateRoot)) | Out-Null }
+    return $roots.ToArray()
+}
+
+function ConvertTo-ProcessArgument {
+    param([string]$Value)
+    if ($null -eq $Value) { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+    return '"' + ($Value -replace '"', '\"') + '"'
+}
+
+function Get-CurrentPowerShellPath {
+    try {
+        $path = (Get-Process -Id $PID -ErrorAction Stop).Path
+        if ($path -and (Test-Path -LiteralPath $path)) { return $path }
+    } catch { }
+    return (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+}
+
 function Get-ActionSpec {
     param([string]$ActionName, [string]$DriveLetter)
     switch ($ActionName) {
@@ -80,7 +114,9 @@ function Get-ActionSpec {
         'dism-restorehealth'     { @{ Exe = "$env:SystemRoot\System32\dism.exe"; Args = @('/Online','/Cleanup-Image','/RestoreHealth');         Admin = $true;  Expected = '10-45 min'; StripNulls = $false } }
         'dism-analyze-store'     { @{ Exe = "$env:SystemRoot\System32\dism.exe"; Args = @('/Online','/Cleanup-Image','/AnalyzeComponentStore'); Admin = $true;  Expected = '1-5 min';   StripNulls = $false } }
         'dism-component-cleanup' { @{ Exe = "$env:SystemRoot\System32\dism.exe"; Args = @('/Online','/Cleanup-Image','/StartComponentCleanup'); Admin = $true;  Expected = '10-60 min'; StripNulls = $false } }
+        'sfc-verifyonly'         { @{ Exe = "$env:SystemRoot\System32\sfc.exe";  Args = @('/verifyonly');                                       Admin = $true;  Expected = '5-30 min';  StripNulls = $true  } }
         'sfc-scannow'            { @{ Exe = "$env:SystemRoot\System32\sfc.exe";  Args = @('/scannow');                                          Admin = $true;  Expected = '5-30 min';  StripNulls = $true  } }
+        'chkdsk-scan'            { @{ Exe = "$env:SystemRoot\System32\chkdsk.exe"; Args = @("${DriveLetter}:",'/scan');                         Admin = $true;  Expected = '1-10 min';  StripNulls = $false } }
         'chkdsk-schedule'        { @{ Exe = 'cmd.exe'; Args = @('/c', "echo y| chkdsk ${DriveLetter}: /f");                                     Admin = $true;  Expected = 'seconds';   StripNulls = $false } }
         'winsock-reset'          { @{ Exe = "$env:SystemRoot\System32\netsh.exe"; Args = @('winsock','reset');                                  Admin = $true;  Expected = 'seconds';   StripNulls = $false } }
         'dns-flush'              { @{ Exe = "$env:SystemRoot\System32\ipconfig.exe"; Args = @('/flushdns');                                     Admin = $false; Expected = 'seconds';   StripNulls = $false } }
@@ -90,8 +126,11 @@ function Get-ActionSpec {
 }
 
 function Get-JobDirs {
-    $root = Get-StateRoot
-    @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+    $dirs = @()
+    foreach ($root in Get-StateRoots) {
+        $dirs += @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)
+    }
+    @($dirs | Sort-Object Name -Descending)
 }
 
 function Resolve-JobDir {
@@ -111,8 +150,8 @@ function Read-JobLogTail {
         if (Test-Path -LiteralPath $logPath) {
             # output.log.cmd is the live stdout redirect while the job runs; it gets merged into
             # output.log when the wrapper finishes, after which it only duplicates content we
-            # would already have — but tailing both is harmless and keeps mid-run status live.
-            $raw += @(Get-Content -LiteralPath $logPath -Tail ([Math]::Max($Lines, 1)) -ErrorAction SilentlyContinue)
+            # would already have, but tailing both is harmless and keeps mid-run status live.
+            $raw += @(Get-Content -LiteralPath $logPath -Tail ([Math]::Max($Lines, 1)) -ErrorAction SilentlyContinue | ForEach-Object { [string]$_ })
         }
     }
     if ($StripNulls) { $raw = @($raw | ForEach-Object { ($_ -replace "`0", '') }) }
@@ -134,8 +173,8 @@ function Get-ExitInterpretation {
     $text = ($LogTail -join "`n")
     if ($ActionName -like 'dism-*') {
         switch ($ExitCode) {
-            0     { if ($text -match 'repairable|可修复')      { return 'Corruption detected and repairable. Run dism-restorehealth next.' }
-                    if ($text -match 'No component store corruption|未检测到组件存储损坏') { return 'Component store is healthy.' }
+            0     { if ($text -match 'repairable')      { return 'Corruption detected and repairable. Run dism-restorehealth next.' }
+                    if ($text -match 'No component store corruption') { return 'Component store is healthy.' }
                     return 'Completed successfully.' }
             87    { return 'Invalid argument (exit 87). Check DISM syntax and Windows edition.' }
             1726  { return 'RPC failure (exit 1726). Retry after reboot; check Winmgmt/RpcSs services.' }
@@ -147,16 +186,21 @@ function Get-ExitInterpretation {
             }
         }
     }
-    if ($ActionName -eq 'sfc-scannow') {
-        if ($text -match 'did not find any integrity violations|未找到任何完整性冲突') { return 'No integrity violations found.' }
-        if ($text -match 'successfully repaired|成功修复')   { return 'Corrupt files found and repaired. Verify [SR] lines in C:\Windows\Logs\CBS\CBS.log, then reboot.' }
-        if ($text -match 'unable to fix|无法修复')           { return 'Corrupt files found but NOT repaired. Run dism-restorehealth, then rerun sfc-scannow.' }
-        if ($text -match 'could not perform|无法执行')        { return 'SFC could not run (often pending reboot or servicing in progress). Reboot and retry.' }
+    if ($ActionName -like 'sfc-*') {
+        if ($text -match 'did not find any integrity violations') { return 'No integrity violations found.' }
+        if ($ActionName -eq 'sfc-verifyonly' -and $text -match 'found integrity violations') { return 'Integrity violations found. Run dism-restorehealth if component store health is suspect, then sfc-scannow when repair is approved.' }
+        if ($text -match 'successfully repaired')   { return 'Corrupt files found and repaired. Verify [SR] lines in C:\Windows\Logs\CBS\CBS.log, then reboot.' }
+        if ($text -match 'unable to fix')           { return 'Corrupt files found but NOT repaired. Run dism-restorehealth, then rerun sfc-scannow.' }
+        if ($text -match 'could not perform')        { return 'SFC could not run (often pending reboot or servicing in progress). Reboot and retry.' }
         return "Completed with exit code $ExitCode. Parse the log text; SFC exit codes alone are unreliable."
     }
     if ($ActionName -eq 'chkdsk-schedule') {
-        if ($text -match 'will be checked|scheduled|计划') { return 'chkdsk scheduled for next boot. Reboot to run it; check Wininit event 1001 afterwards.' }
+        if ($text -match 'will be checked|scheduled') { return 'chkdsk scheduled for next boot. Reboot to run it; check Wininit event 1001 afterwards.' }
         return "Completed with exit code $ExitCode. Verify scheduling output in the log."
+    }
+    if ($ActionName -eq 'chkdsk-scan') {
+        if ($ExitCode -eq 0) { return 'Online disk scan completed. Review the log tail for file-system problems or required offline repair.' }
+        return "Online disk scan completed with exit code $ExitCode. Review the log tail; offline repair may be required."
     }
     if ($ActionName -eq 'winsock-reset') { return 'Winsock catalog reset. Reboot required to take effect.' }
     if ($ActionName -eq 'wu-reset') {
@@ -206,9 +250,7 @@ Set-Content -LiteralPath '$exitFile' -Value `$code
         return $wrapperPath
     }
 
-    # Quote args that contain spaces/pipes so Start-Process passes them intact (e.g. cmd /c "echo y| chkdsk C: /f").
-    $quotedArgs = @($Spec.Args | ForEach-Object { if ($_ -match '[\s|&<>]') { '"' + $_ + '"' } else { $_ } })
-    $argString = ($quotedArgs -join ' ') -replace "'", "''"
+    $argArrayLiteral = (@($Spec.Args | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ', ')
     $exeEscaped = $Spec.Exe -replace "'", "''"
     $errLog = Join-Path $JobDir 'stderr.log'
     $body = @"
@@ -216,14 +258,9 @@ Set-Content -LiteralPath '$exitFile' -Value `$code
 Add-Content -LiteralPath '$outLog' -Value ("STARTED {0} :: $ActionName" -f (Get-Date -Format 'o'))
 `$code = 1
 try {
-    # Note: this wrapper always runs under Windows PowerShell 5.1 (launched explicitly by the runner).
-    # Redirecting to files (instead of pipeline capture) preserves DISM's carriage-return progress
-    # lines, so 'status' can show live percentages. SFC writes UTF-16 to its redirect; the runner
-    # strips embedded nulls when displaying the log.
-    `$proc = Start-Process -FilePath '$exeEscaped' -ArgumentList '$argString' -NoNewWindow -PassThru ``
-        -RedirectStandardOutput '$outLog.cmd' -RedirectStandardError '$errLog'
-    `$proc.WaitForExit()
-    `$code = `$proc.ExitCode
+    `$argList = @($argArrayLiteral)
+    & '$exeEscaped' @argList > '$outLog.cmd' 2> '$errLog'
+    if (`$null -ne `$LASTEXITCODE) { `$code = `$LASTEXITCODE } else { `$code = 0 }
 } catch {
     Add-Content -LiteralPath '$outLog' -Value ("WRAPPER ERROR: {0}" -f `$_.Exception.Message)
 }
@@ -241,6 +278,42 @@ Set-Content -LiteralPath '$exitFile' -Value `$code
 "@
     Set-Content -LiteralPath $wrapperPath -Value $body -Encoding UTF8
     return $wrapperPath
+}
+
+function Invoke-ElevatedStart {
+    param([string]$ActionName, [string]$DriveLetter)
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'Cannot auto-elevate because PSCommandPath is empty.' }
+
+    $startedAfter = (Get-Date).AddSeconds(-2)
+    $childArgs = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $PSCommandPath,
+        'start',
+        '-Action', $ActionName,
+        '-Drive', $DriveLetter,
+        '-ElevatedChild'
+    )
+    if ($AsJson) { $childArgs += '-AsJson' }
+    $argumentLine = (@($childArgs | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' ')
+    $process = Start-Process -FilePath (Get-CurrentPowerShellPath) -ArgumentList $argumentLine -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+    if ($process.ExitCode -ne 0) { throw "Elevated start exited with code $($process.ExitCode)." }
+
+    Start-Sleep -Milliseconds 300
+    $dir = Get-JobDirs |
+        Where-Object { $_.Name -like "*-$ActionName" -and $_.LastWriteTime -ge $startedAfter } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($dir) {
+        Write-Status (Get-JobStatus -JobDir $dir -Lines $TailLines)
+        return
+    }
+    if ($AsJson) {
+        [pscustomobject]@{ Action = $ActionName; State = 'StartedElevated'; Note = 'Job was started elevated, but its state directory was not visible to this user.' } | ConvertTo-Json
+    } else {
+        Write-Host "STARTED_ELEVATED ACTION=$ActionName"
+        Write-Host 'Job was started elevated, but its state directory was not visible to this user.'
+    }
 }
 
 function Get-JobStatus {
@@ -295,12 +368,16 @@ function Write-Status {
 
 switch ($Mode) {
     'start' {
-        if ([string]::IsNullOrWhiteSpace($Action)) { throw "start requires -Action. Valid: dism-checkhealth, dism-scanhealth, dism-restorehealth, dism-analyze-store, dism-component-cleanup, sfc-scannow, chkdsk-schedule, wu-reset, winsock-reset, dns-flush" }
+        if ([string]::IsNullOrWhiteSpace($Action)) { throw "start requires -Action. Valid: dism-checkhealth, dism-scanhealth, dism-restorehealth, dism-analyze-store, dism-component-cleanup, sfc-verifyonly, sfc-scannow, chkdsk-scan, chkdsk-schedule, wu-reset, winsock-reset, dns-flush" }
         $spec = Get-ActionSpec -ActionName $Action -DriveLetter $Drive
+        if ($spec.Admin -and -not (Test-Admin) -and -not $ElevatedChild) {
+            Invoke-ElevatedStart -ActionName $Action -DriveLetter $Drive
+            break
+        }
         if ($spec.Admin -and -not (Test-Admin)) { throw "Action '$Action' requires an elevated (Administrator) shell." }
 
         # Refuse overlapping servicing operations: DISM and SFC share the servicing stack.
-        $servicingActions = @('dism-scanhealth','dism-restorehealth','dism-component-cleanup','sfc-scannow','dism-checkhealth','dism-analyze-store')
+        $servicingActions = @('dism-scanhealth','dism-restorehealth','dism-component-cleanup','sfc-verifyonly','sfc-scannow','dism-checkhealth','dism-analyze-store')
         if ($Action -in $servicingActions) {
             foreach ($dir in Get-JobDirs) {
                 $existing = Get-JobStatus -JobDir $dir -Lines 3
