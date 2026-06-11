@@ -200,9 +200,9 @@ function runAudit(flags: Map<string, string | boolean>, loadFullReport: boolean)
   if (boolFlag(flags, "probe-tools")) psArgs.push("-ProbeToolVersions");
 
   const sections = listFlag(flags, "sections");
-  if (sections.length) psArgs.push("-Sections", ...sections);
+  if (sections.length) psArgs.push("-Sections", sections.join(","));
   const excludeSections = listFlag(flags, "exclude-sections");
-  if (excludeSections.length) psArgs.push("-ExcludeSections", ...excludeSections);
+  if (excludeSections.length) psArgs.push("-ExcludeSections", excludeSections.join(","));
   appendNumberArg(psArgs, flags, "max-system-events", "-MaxSystemEvents");
   appendNumberArg(psArgs, flags, "max-app-events", "-MaxAppEvents");
   appendNumberArg(psArgs, flags, "event-message-max-length", "-EventMessageMaxLength");

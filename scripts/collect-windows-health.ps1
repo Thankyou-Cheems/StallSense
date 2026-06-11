@@ -96,11 +96,11 @@ function Invoke-ElevatedCollector {
     if ($Quick) { $childArgs += '-Quick' }
     if ($Sections -and $Sections.Count -gt 0) {
         $childArgs += '-Sections'
-        $childArgs += @($Sections | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $childArgs += (Normalize-SectionNameList $Sections) -join ','
     }
     if ($ExcludeSections -and $ExcludeSections.Count -gt 0) {
         $childArgs += '-ExcludeSections'
-        $childArgs += @($ExcludeSections | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $childArgs += (Normalize-SectionNameList $ExcludeSections) -join ','
     }
 
     $argumentLine = (@($childArgs | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' ')
@@ -264,6 +264,60 @@ function Get-WhereResults {
     }
 }
 
+function Normalize-SectionNameList {
+    param([AllowNull()][string[]]$Names)
+    if (-not $Names) { return @() }
+    return @(
+        $Names |
+            ForEach-Object { [string]$_ -split ',' } |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ }
+    )
+}
+
+function Test-WindowsAppsAliasPath {
+    param([AllowNull()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    return ((Expand-RegistryString $Path) -match '\\AppData\\Local\\Microsoft\\WindowsApps\\')
+}
+
+function Get-ToolchainMatchKey {
+    param([AllowNull()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    $expanded = Expand-RegistryString $Path
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($expanded)
+    } catch {
+        $fullPath = $expanded
+    }
+    $directory = [System.IO.Path]::GetDirectoryName($fullPath)
+    $fileName = [System.IO.Path]::GetFileName($fullPath)
+    $extension = [System.IO.Path]::GetExtension($fileName)
+    if ([string]::IsNullOrWhiteSpace($directory) -or [string]::IsNullOrWhiteSpace($fileName)) {
+        return $fullPath.TrimEnd('\').ToLowerInvariant()
+    }
+    if ($extension -in @('', '.bat', '.cmd', '.com', '.exe')) {
+        $fileName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+    }
+    return (Join-Path $directory $fileName).TrimEnd('\').ToLowerInvariant()
+}
+
+function Get-ActionableToolchainMatches {
+    param([AllowNull()][string[]]$Matches)
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+    $actionable = New-Object System.Collections.Generic.List[string]
+    $first = if ($Matches -and $Matches.Count -gt 0) { $Matches[0] } else { $null }
+    foreach ($match in @($Matches)) {
+        if ([string]::IsNullOrWhiteSpace($match)) { continue }
+        if ($first -and $match -ne $first -and (Test-WindowsAppsAliasPath $match)) { continue }
+        $key = Get-ToolchainMatchKey $match
+        if ($key -and $seen.Add($key)) {
+            $actionable.Add($match) | Out-Null
+        }
+    }
+    return $actionable.ToArray()
+}
+
 function Test-UnquotedPathWithSpaces {
     param([AllowNull()][string]$Command, [AllowNull()][string]$Target)
     if ([string]::IsNullOrWhiteSpace($Command) -or [string]::IsNullOrWhiteSpace($Target)) { return $false }
@@ -362,7 +416,7 @@ if ($Quick) {
     if (-not $PSBoundParameters.ContainsKey('MaxAppEvents')) { $MaxAppEvents = 800 }
 }
 if ($Sections -and $Sections.Count -gt 0) {
-    $requested = @($Sections | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $requested = @(Normalize-SectionNameList $Sections)
     $unknown = @($requested | Where-Object { $script:AllSectionNames -notcontains $_ })
     if ($unknown.Count -gt 0) {
         Write-Warning ("Unknown section name(s): {0}. Valid: {1}" -f ($unknown -join ', '), ($script:AllSectionNames -join ', '))
@@ -370,7 +424,7 @@ if ($Sections -and $Sections.Count -gt 0) {
     $script:EnabledSections = @($script:AllSectionNames | Where-Object { $requested -contains $_ })
 }
 if ($ExcludeSections -and $ExcludeSections.Count -gt 0) {
-    $excluded = @($ExcludeSections | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $excluded = @(Normalize-SectionNameList $ExcludeSections)
     $script:EnabledSections = @($script:EnabledSections | Where-Object { $excluded -notcontains $_ })
 }
 
@@ -1052,6 +1106,7 @@ $sectionData['DeveloperToolchain'] = Invoke-Safe 'DeveloperToolchain' {
     $rows = New-Object System.Collections.Generic.List[object]
     foreach ($cmd in $commands) {
         $where = @(Get-WhereResults $cmd)
+        $actionableMatches = @(Get-ActionableToolchainMatches $where)
         $commandInfo = Get-Command $cmd -ErrorAction SilentlyContinue | Select-Object -First 1
         $version = $null
         if ($ProbeToolVersions) {
@@ -1072,11 +1127,13 @@ $sectionData['DeveloperToolchain'] = Invoke-Safe 'DeveloperToolchain' {
             ResolvedPath = $commandInfo.Source
             AllWhereMatches = $where
             MatchCount = $where.Count
+            ActionableWhereMatches = $actionableMatches
+            ActionableMatchCount = $actionableMatches.Count
             Version = $version
             VersionProbed = [bool]$ProbeToolVersions
         }
         $rows.Add($row) | Out-Null
-        if ($where.Count -gt 1) {
+        if ($actionableMatches.Count -gt 1) {
             Add-Finding 'Low' 'DeveloperToolchain' "Multiple PATH matches for command: $cmd" $row 'Confirm the first match is the intended version.'
         }
     }
